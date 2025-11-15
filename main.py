@@ -1,6 +1,6 @@
 import logging
 import time
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 import requests
 from config import Config
 from discord_webhook import DiscordWebhook
