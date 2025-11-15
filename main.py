@@ -115,6 +115,23 @@ def connect_supabase():
     try:
         supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
         logger.info("Successfully connected to Supabase")
+        
+        # Test the connection by trying to query the table
+        try:
+            test_response = supabase.table(config.SUPABASE_TABLE).select("id").limit(1).execute()
+            logger.info(f"Successfully tested Supabase connection to table '{config.SUPABASE_TABLE}'")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "permission denied" in error_msg or "row-level security" in error_msg:
+                logger.error("SUPABASE RLS WARNING: Row Level Security may be blocking queries.")
+                logger.error("Please check your Supabase RLS policies for SELECT operations.")
+            elif "relation" in error_msg and "does not exist" in error_msg:
+                logger.error(f"SUPABASE TABLE ERROR: Table '{config.SUPABASE_TABLE}' does not exist.")
+                logger.error("Please create the table in your Supabase project.")
+            else:
+                logger.warning(f"Could not test Supabase table access: {e}")
+                logger.warning("The bot will continue, but posts may not be saved properly.")
+        
         return supabase
     except Exception as e:
         logger.error(f"Failed to connect to Supabase: {e}")
@@ -124,10 +141,16 @@ def is_post_processed(supabase, post_id):
     """Check if a post has already been processed"""
     try:
         response = supabase.table(config.SUPABASE_TABLE).select("id").eq("id", post_id).execute()
-        return len(response.data) > 0
+        exists = len(response.data) > 0
+        if exists:
+            logger.debug(f"Post {post_id} found in database")
+        return exists
     except Exception as e:
         logger.error(f"Error checking if post is processed: {e}")
-        raise
+        logger.error(f"Post ID: {post_id}")
+        # If we can't check, assume it's not processed to avoid missing posts
+        # but log the error so we know there's an issue
+        return False
 
 def mark_post_processed(supabase, post):
     """Mark a post as processed in Supabase with additional metadata"""
@@ -148,10 +171,38 @@ def mark_post_processed(supabase, post):
                 if m.get("type") in ["image", "video", "gifv"]
             ]
         }
-        supabase.table(config.SUPABASE_TABLE).insert(doc).execute()
-        logger.info(f"Successfully marked post {post['id']} as processed")
+        # Use upsert to handle duplicate keys gracefully
+        # Upsert will update if exists, insert if not (based on primary key)
+        response = supabase.table(config.SUPABASE_TABLE).upsert(doc).execute()
+        
+        # Verify the post was actually saved
+        if response.data and len(response.data) > 0:
+            logger.info(f"Successfully marked post {post['id']} as processed")
+        else:
+            logger.warning(f"Upsert completed but no data returned for post {post['id']}")
+            # Verify by checking if it exists
+            verify_response = supabase.table(config.SUPABASE_TABLE).select("id").eq("id", post["id"]).execute()
+            if len(verify_response.data) == 0:
+                raise Exception(f"Post {post['id']} was not saved to database after upsert")
     except Exception as e:
+        error_msg = str(e)
         logger.error(f"Error marking post as processed: {e}")
+        logger.error(f"Post ID: {post.get('id', 'unknown')}")
+        
+        # Check for common Supabase errors
+        if "permission denied" in error_msg.lower() or "row-level security" in error_msg.lower():
+            logger.error("SUPABASE RLS ERROR: Row Level Security (RLS) is blocking the insert.")
+            logger.error("Please check your Supabase RLS policies for the table.")
+            logger.error("You may need to create a policy that allows INSERT operations.")
+        elif "duplicate key" in error_msg.lower():
+            logger.warning(f"Post {post.get('id')} already exists, but that's okay (upsert should handle this)")
+            # If it's just a duplicate, we can consider it processed
+            return
+        elif "relation" in error_msg.lower() and "does not exist" in error_msg.lower():
+            logger.error("SUPABASE TABLE ERROR: The table does not exist.")
+            logger.error(f"Please verify the table name '{config.SUPABASE_TABLE}' exists in your Supabase project.")
+        
+        # Re-raise to prevent the post from being considered processed
         raise
 
 def send_to_discord(message, media_attachments=None):
@@ -375,9 +426,16 @@ def main():
                 message = format_discord_message(post)
                 if message:
                     media_attachments = post.get('media_attachments', [])
-                    send_to_discord(message, media_attachments)
-                    # Mark as processed only if successfully sent to Discord
-                    mark_post_processed(supabase_client, post)
+                    try:
+                        send_to_discord(message, media_attachments)
+                        # Mark as processed only if successfully sent to Discord
+                        mark_post_processed(supabase_client, post)
+                        logger.info(f"Successfully processed and saved post {post['id']}")
+                    except Exception as e:
+                        logger.error(f"Failed to process post {post['id']}: {e}")
+                        # Don't continue processing other posts if there's a critical error
+                        # This ensures we don't spam Discord with duplicates
+                        raise
                 
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
