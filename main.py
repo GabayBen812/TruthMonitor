@@ -21,6 +21,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# In-memory cache to track processed posts (fallback if Supabase fails)
+processed_posts_cache = set()
+
 # Rate limit: 1 request per 2 seconds for Discord
 DISCORD_CALLS = 30
 DISCORD_PERIOD = 60
@@ -138,52 +141,76 @@ def connect_supabase():
         raise
 
 def is_post_processed(supabase, post_id):
-    """Check if a post has already been processed"""
+    """Check if a post has already been processed (checks both Supabase and cache)"""
+    # First check in-memory cache (fastest)
+    if post_id in processed_posts_cache:
+        logger.debug(f"Post {post_id} found in cache")
+        return True
+    
+    # Then check Supabase
     try:
         response = supabase.table(config.SUPABASE_TABLE).select("id").eq("id", post_id).execute()
         exists = len(response.data) > 0
         if exists:
             logger.debug(f"Post {post_id} found in database")
+            # Add to cache for faster future lookups
+            processed_posts_cache.add(post_id)
         return exists
     except Exception as e:
         logger.error(f"Error checking if post is processed: {e}")
         logger.error(f"Post ID: {post_id}")
-        # If we can't check, assume it's not processed to avoid missing posts
-        # but log the error so we know there's an issue
-        return False
+        # If we can't check Supabase, rely on cache only
+        return post_id in processed_posts_cache
 
 def mark_post_processed(supabase, post):
     """Mark a post as processed in Supabase with additional metadata"""
     try:
+        # Build document with only the essential fields that should exist in the table
         doc = {
-            "id": post["id"],
-            "content": post.get("content", ""),
-            "created_at": post["created_at"],
-            "sent_at": datetime.now(UTC).isoformat(),
-            "username": post.get("account", {}).get("username", ""),
-            "display_name": post.get("account", {}).get("display_name", ""),
-            "media_attachments": [
-                {
-                    "type": m.get("type"),
-                    "url": m.get("url") or m.get("preview_url")
-                }
-                for m in post.get("media_attachments", [])
-                if m.get("type") in ["image", "video", "gifv"]
-            ]
+            "id": str(post["id"]),  # Ensure it's a string
+            "content": post.get("content", "") or "",
+            "created_at": post.get("created_at", ""),
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "username": post.get("account", {}).get("username", "") or ""
         }
+        
+        # Only add optional fields if they exist in the post
+        display_name = post.get("account", {}).get("display_name")
+        if display_name:
+            doc["display_name"] = display_name
+        
+        media_attachments = [
+            {
+                "type": m.get("type"),
+                "url": m.get("url") or m.get("preview_url")
+            }
+            for m in post.get("media_attachments", [])
+            if m.get("type") in ["image", "video", "gifv"]
+        ]
+        if media_attachments:
+            doc["media_attachments"] = media_attachments
         # Use upsert to handle duplicate keys gracefully
         # Upsert will update if exists, insert if not (based on primary key)
+        logger.debug(f"Attempting to upsert post {post['id']} to table {config.SUPABASE_TABLE}")
+        logger.debug(f"Document to save: {doc}")
         response = supabase.table(config.SUPABASE_TABLE).upsert(doc).execute()
+        
+        logger.debug(f"Supabase response: {response}")
+        logger.debug(f"Response data: {response.data if hasattr(response, 'data') else 'No data attribute'}")
         
         # Verify the post was actually saved
         if response.data and len(response.data) > 0:
-            logger.info(f"Successfully marked post {post['id']} as processed")
+            logger.info(f"Successfully marked post {post['id']} as processed. Response: {response.data}")
         else:
             logger.warning(f"Upsert completed but no data returned for post {post['id']}")
+            logger.warning(f"Response object: {response}")
             # Verify by checking if it exists
             verify_response = supabase.table(config.SUPABASE_TABLE).select("id").eq("id", post["id"]).execute()
+            logger.debug(f"Verification query result: {verify_response.data}")
             if len(verify_response.data) == 0:
-                raise Exception(f"Post {post['id']} was not saved to database after upsert")
+                raise Exception(f"Post {post['id']} was not saved to database after upsert. Response was: {response}")
+            else:
+                logger.info(f"Post {post['id']} verified to exist in database despite empty upsert response")
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error marking post as processed: {e}")
@@ -422,20 +449,35 @@ def main():
                 
                 logger.info(f"Processing new post {post['id']}")
                 
-                # Format and send to Discord
+                # Format message first
                 message = format_discord_message(post)
-                if message:
-                    media_attachments = post.get('media_attachments', [])
-                    try:
-                        send_to_discord(message, media_attachments)
-                        # Mark as processed only if successfully sent to Discord
-                        mark_post_processed(supabase_client, post)
-                        logger.info(f"Successfully processed and saved post {post['id']}")
-                    except Exception as e:
-                        logger.error(f"Failed to process post {post['id']}: {e}")
-                        # Don't continue processing other posts if there's a critical error
-                        # This ensures we don't spam Discord with duplicates
-                        raise
+                if not message:
+                    logger.warning(f"Could not format message for post {post['id']}, skipping")
+                    continue
+                
+                media_attachments = post.get('media_attachments', [])
+                post_id = post['id']
+                
+                try:
+                    # Try to save to Supabase first
+                    mark_post_processed(supabase_client, post)
+                    logger.info(f"Successfully saved post {post_id} to Supabase")
+                except Exception as e:
+                    logger.error(f"Failed to save post {post_id} to Supabase: {e}")
+                    logger.warning(f"Will still send to Discord and use cache to prevent duplicates")
+                
+                # Add to cache to prevent duplicates (even if Supabase save failed)
+                processed_posts_cache.add(post_id)
+                
+                # Send to Discord (even if Supabase save failed, we use cache to prevent duplicates)
+                try:
+                    send_to_discord(message, media_attachments)
+                    logger.info(f"Successfully sent post {post_id} to Discord")
+                except Exception as e:
+                    logger.error(f"Failed to send post {post_id} to Discord: {e}")
+                    # Remove from cache if Discord send failed, so we can retry later
+                    processed_posts_cache.discard(post_id)
+                    raise
                 
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
