@@ -435,7 +435,8 @@ def main():
             # Get posts
             posts = get_truth_social_posts()
             
-            # Process posts in reverse chronological order
+            # Process posts in reverse chronological order (newest first)
+            # Only process the LATEST new post to avoid spamming on startup
             for post in sorted(posts, key=lambda x: x.get('created_at', ''), reverse=True):
                 # Validate post structure
                 if not isinstance(post, dict) or 'id' not in post:
@@ -447,7 +448,8 @@ def main():
                     logger.debug(f"Post {post['id']} already processed, skipping")
                     continue
                 
-                logger.info(f"Processing new post {post['id']}")
+                # Found a new post - process only this one (the latest)
+                logger.info(f"Processing new post {post['id']} (latest unprocessed post)")
                 
                 # Format message first
                 message = format_discord_message(post)
@@ -478,6 +480,11 @@ def main():
                     # Remove from cache if Discord send failed, so we can retry later
                     processed_posts_cache.discard(post_id)
                     raise
+                
+                # IMPORTANT: Only process the latest new post, then break
+                # This prevents spamming old posts on startup
+                logger.info(f"Processed latest new post. Stopping here to avoid processing older posts.")
+                break
                 
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
