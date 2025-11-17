@@ -12,7 +12,7 @@ class Config(object):
     LOG_LEVEL = os.getenv("LOG_LEVEL") or 'INFO'
     APPNAME = os.getenv("APPNAME") or 'Truth Social Monitor'
     ENV = os.getenv("ENV") or "DEV"
-    REPEAT_DELAY = int(os.getenv("REPEAT_DELAY") or 300)  # 5 minutes default
+    REPEAT_DELAY = int(os.getenv("REPEAT_DELAY") or 10)  # 10 seconds default (optimized for speed)
 
     # Discord configuration
     DISCORD_NOTIFY = os.getenv("DISCORD_NOTIFY", 'True').lower() == 'true'

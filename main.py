@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 # In-memory cache to track processed posts (fallback if Supabase fails)
 processed_posts_cache = set()
 
+# Cache user ID to avoid repeated lookups
+cached_user_id = None
+
 # Rate limit: 1 request per 2 seconds for Discord
 DISCORD_CALLS = 30
 DISCORD_PERIOD = 60
@@ -59,7 +62,7 @@ def make_flaresolverr_request(url, headers=None, params=None):
     payload = {
         "cmd": "request.get",
         "url": url,
-        "maxTimeout": 25000,
+        "maxTimeout": 15000,  # Reduced from 25000 to 15000 for faster timeouts
     }
     if headers:
         payload["headers"] = headers
@@ -280,6 +283,19 @@ def send_to_discord(message, media_attachments=None):
         logger.error(f"Error sending message to Discord: {e}")
         raise
 
+def is_retweet(content):
+    """Check if a post is a retweet by looking for RT pattern at the beginning"""
+    if not content:
+        return False
+    
+    # Strip HTML tags first for accurate detection
+    text = BeautifulSoup(content, 'html.parser').get_text().strip()
+    
+    # Check if content starts with RT followed by space or @ (common retweet patterns)
+    # Examples: "RT @username", "RT username", etc.
+    text_upper = text.upper()
+    return text_upper.startswith('RT ') or text_upper.startswith('RT@')
+
 def clean_html_and_format(text):
     """Clean HTML tags and format text for Discord"""
     if not text:
@@ -376,7 +392,9 @@ def download_media(url):
         return None, None
 
 def get_truth_social_posts():
-    """Get posts from Truth Social using Mastodon API via ScrapeOps proxy"""
+    """Get posts from Truth Social using Mastodon API via FlareSolverr"""
+    global cached_user_id
+    
     try:
         # Prepare headers that look like a real browser
         headers = {
@@ -387,24 +405,26 @@ def get_truth_social_posts():
             'Origin': f'https://{config.TRUTH_INSTANCE}'
         }
 
-        # First get the user ID
-        lookup_url = f'https://{config.TRUTH_INSTANCE}/api/v1/accounts/lookup?acct={config.TRUTH_USERNAME}'
-        
-        response = make_flaresolverr_request(lookup_url, headers)
-        user_data = response.json()
-        
-        if not user_data or 'id' not in user_data:
-            raise ValueError(f"Could not find user ID for {config.TRUTH_USERNAME}")
+        # Use cached user ID to avoid repeated lookups (optimization)
+        if cached_user_id is None:
+            lookup_url = f'https://{config.TRUTH_INSTANCE}/api/v1/accounts/lookup?acct={config.TRUTH_USERNAME}'
+            response = make_flaresolverr_request(lookup_url, headers)
+            user_data = response.json()
             
-        user_id = user_data['id']
-        logger.debug(f"Found user ID: {user_id}")
+            if not user_data or 'id' not in user_data:
+                raise ValueError(f"Could not find user ID for {config.TRUTH_USERNAME}")
+                
+            cached_user_id = user_data['id']
+            logger.debug(f"Found and cached user ID: {cached_user_id}")
         
-        # Now get their posts
+        user_id = cached_user_id
+        
+        # Optimized: Only fetch 5 posts since we only need the latest new one
         posts_url = f'https://{config.TRUTH_INSTANCE}/api/v1/accounts/{user_id}/statuses'
         params = {
             'exclude_replies': 'true',
             'exclude_reblogs': 'true',
-            'limit': '40'
+            'limit': '5'  # Reduced from 40 to 5 for faster processing
         }
         
         response = make_flaresolverr_request(posts_url, params=params, headers=headers)
@@ -418,6 +438,8 @@ def get_truth_social_posts():
         
     except Exception as e:
         logger.error(f"Error getting Truth Social posts: {e}")
+        # Reset cached user ID on error in case it's invalid
+        cached_user_id = None
         return []
 
 def main():
@@ -446,6 +468,19 @@ def main():
                 # Skip if already processed
                 if is_post_processed(supabase_client, post['id']):
                     logger.debug(f"Post {post['id']} already processed, skipping")
+                    continue
+                
+                # Skip retweets - filter them out
+                content = post.get('content') or post.get('text', '')
+                if is_retweet(content):
+                    logger.info(f"Post {post['id']} is a retweet, skipping")
+                    # Mark as processed so we don't check it again
+                    processed_posts_cache.add(post['id'])
+                    try:
+                        # Save to Supabase to mark as processed (even though we're not sending it)
+                        mark_post_processed(supabase_client, post)
+                    except Exception as e:
+                        logger.debug(f"Could not save retweet to Supabase (non-critical): {e}")
                     continue
                 
                 # Found a new post - process only this one (the latest)
@@ -490,6 +525,8 @@ def main():
             logger.error(f"Error in main loop: {e}")
         
         delay = int(config.REPEAT_DELAY)
+        if delay < 5:
+            logger.warning(f"REPEAT_DELAY is very low ({delay}s). Consider at least 5 seconds to avoid rate limiting.")
         logger.info(f"Waiting {delay} seconds before next check...")
         time.sleep(delay)
 
