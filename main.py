@@ -27,6 +27,13 @@ processed_posts_cache = set()
 # Cache user ID to avoid repeated lookups
 cached_user_id = None
 
+# Keywords that trigger @everyone mention and post sending
+KEYWORDS = [
+    'strike', 'striking', 'ISIS', 'Syria', 'soil', 'Nigeria', 'Iran', 'Israel', 'Yemen',
+    'I just spoke', 'ceasefire', 'truce', 'Putin', 'Zelensky', 'Zelenskyy', 'Vladimir',
+    'negotiations', 'agreement', 'negotiate'
+]
+
 # Rate limit: 1 request per 2 seconds for Discord
 DISCORD_CALLS = 30
 DISCORD_PERIOD = 60
@@ -296,6 +303,23 @@ def is_retweet(content):
     text_upper = text.upper()
     return text_upper.startswith('RT ') or text_upper.startswith('RT@')
 
+def contains_keyword(content):
+    """Check if content contains any of the keywords (case-insensitive)"""
+    if not content:
+        return False
+    
+    # Strip HTML tags and get clean text
+    text = BeautifulSoup(content, 'html.parser').get_text()
+    text_lower = text.lower()
+    
+    # Check if any keyword is in the text
+    for keyword in KEYWORDS:
+        if keyword.lower() in text_lower:
+            logger.info(f"Found keyword match: '{keyword}' in post")
+            return True
+    
+    return False
+
 def clean_html_and_format(text):
     """Clean HTML tags and format text for Discord"""
     if not text:
@@ -486,11 +510,31 @@ def main():
                 # Found a new post - process only this one (the latest)
                 logger.info(f"Processing new post {post['id']} (latest unprocessed post)")
                 
+                # Check if post contains any keywords
+                content = post.get('content') or post.get('text', '')
+                has_keyword = contains_keyword(content)
+                
+                if not has_keyword:
+                    logger.info(f"Post {post['id']} does not contain any keywords, skipping Discord notification")
+                    # Still mark as processed so we don't check it again
+                    processed_posts_cache.add(post['id'])
+                    try:
+                        mark_post_processed(supabase_client, post)
+                    except Exception as e:
+                        logger.debug(f"Could not save non-keyword post to Supabase (non-critical): {e}")
+                    continue
+                
+                # Post contains keywords - format and send with @everyone
+                logger.info(f"Post {post['id']} contains keywords, sending to Discord with @everyone")
+                
                 # Format message first
                 message = format_discord_message(post)
                 if not message:
                     logger.warning(f"Could not format message for post {post['id']}, skipping")
                     continue
+                
+                # Add @everyone mention at the beginning
+                message = f"@everyone\n{message}"
                 
                 media_attachments = post.get('media_attachments', [])
                 post_id = post['id']
@@ -509,7 +553,7 @@ def main():
                 # Send to Discord (even if Supabase save failed, we use cache to prevent duplicates)
                 try:
                     send_to_discord(message, media_attachments)
-                    logger.info(f"Successfully sent post {post_id} to Discord")
+                    logger.info(f"Successfully sent post {post_id} to Discord with @everyone")
                 except Exception as e:
                     logger.error(f"Failed to send post {post_id} to Discord: {e}")
                     # Remove from cache if Discord send failed, so we can retry later
