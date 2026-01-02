@@ -31,7 +31,7 @@ cached_user_id = None
 KEYWORDS = [
     'strike', 'striking', 'ISIS', 'Syria', 'soil', 'Nigeria', 'Iran', 'Israel', 'Yemen',
     'I just spoke', 'ceasefire', 'truce', 'Putin', 'Zelensky', 'Zelenskyy', 'Vladimir',
-    'negotiations', 'agreement', 'negotiate'
+    'negotiations', 'agreement', 'negotiate', 'meeting'
 ]
 
 # Rate limit: 1 request per 2 seconds for Discord
